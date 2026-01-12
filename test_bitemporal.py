@@ -762,3 +762,844 @@ class TestPerformance:
 
         validation_elapsed = time.perf_counter() - validation_start
         print(f"Validation passed in {validation_elapsed:.2f}s")
+
+
+class TestBasicScenarios:
+    """Tests for basic update scenarios from pytemporal."""
+
+    def test_pure_insert_no_overlap(self):
+        """Insert for IDs not in current state should just insert without expiring."""
+        # Use a non-empty current state with different IDs to avoid chdb empty DataFrame issue
+        current = pd.DataFrame({
+            "id": ["Z"],  # Different ID, no overlap
+            "value": [999],
+            "effective_from": pd.to_datetime(["2020-01-01"]),
+            "effective_to": pd.to_datetime(["2020-12-31"]),
+            "as_of_from": pd.to_datetime(["2020-01-01"]),
+            "as_of_to": pd.Series([pd.NaT]),
+        })
+
+        updates = pd.DataFrame({
+            "id": ["A", "B"],
+            "value": [100, 200],
+            "effective_from": pd.to_datetime(["2024-01-01", "2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-12-31", "2024-06-30"]),
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+        )
+
+        # No expires (no overlap with new IDs)
+        assert len(result.expires) == 0
+
+        # Should insert both new records
+        assert len(result.inserts) == 2
+
+    def test_overwrite_exact_range(self):
+        """Update with exact same effective range should replace the record."""
+        current = pd.DataFrame({
+            "id": ["A"],
+            "value": [100],
+            "effective_from": pd.to_datetime(["2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-12-31"]),
+            "as_of_from": pd.to_datetime(["2024-01-01"]),
+            "as_of_to": pd.Series([pd.NaT]),
+        })
+
+        updates = pd.DataFrame({
+            "id": ["A"],
+            "value": [200],  # Different value
+            "effective_from": pd.to_datetime(["2024-01-01"]),  # Same range
+            "effective_to": pd.to_datetime(["2024-12-31"]),
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+        )
+
+        # Original should expire
+        assert len(result.expires) == 1
+
+        # Should insert single replacement
+        assert len(result.inserts) == 1
+        assert result.inserts.iloc[0]["value"] == 200
+
+    def test_unrelated_state_no_overlap(self):
+        """Updates to different IDs or non-overlapping ranges should just insert."""
+        current = pd.DataFrame({
+            "id": ["A"],
+            "value": [100],
+            "effective_from": pd.to_datetime(["2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-06-30"]),
+            "as_of_from": pd.to_datetime(["2024-01-01"]),
+            "as_of_to": pd.Series([pd.NaT]),
+        })
+
+        updates = pd.DataFrame({
+            "id": ["B", "A"],
+            "value": [200, 300],
+            "effective_from": pd.to_datetime(["2024-01-01", "2024-07-01"]),  # B is new ID, A is after existing
+            "effective_to": pd.to_datetime(["2024-12-31", "2024-12-31"]),
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+        )
+
+        # No expires (no overlap)
+        assert len(result.expires) == 0
+
+        # Should insert both new records
+        assert len(result.inserts) == 2
+
+    def test_append_tail_overlapping(self):
+        """Update at the end of existing record (overlapping) should slice."""
+        current = pd.DataFrame({
+            "id": ["A"],
+            "value": [100],
+            "effective_from": pd.to_datetime(["2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-12-31"]),
+            "as_of_from": pd.to_datetime(["2024-01-01"]),
+            "as_of_to": pd.Series([pd.NaT]),
+        })
+
+        updates = pd.DataFrame({
+            "id": ["A"],
+            "value": [200],
+            "effective_from": pd.to_datetime(["2024-06-01"]),  # Starts in middle
+            "effective_to": pd.to_datetime(["2025-06-30"]),    # Extends beyond
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+        )
+
+        # Original should expire
+        assert len(result.expires) == 1
+
+        # Should have 2 segments: before update, update itself
+        assert len(result.inserts) == 2
+
+        inserts = result.inserts.sort_values("effective_from").reset_index(drop=True)
+        assert inserts.iloc[0]["value"] == 100  # Original before update
+        assert inserts.iloc[1]["value"] == 200  # Update
+
+    def test_append_tail_exact_adjacent(self):
+        """Update exactly adjacent to end of existing (no overlap) should just insert."""
+        current = pd.DataFrame({
+            "id": ["A"],
+            "value": [100],
+            "effective_from": pd.to_datetime(["2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-06-30"]),
+            "as_of_from": pd.to_datetime(["2024-01-01"]),
+            "as_of_to": pd.Series([pd.NaT]),
+        })
+
+        updates = pd.DataFrame({
+            "id": ["A"],
+            "value": [200],
+            "effective_from": pd.to_datetime(["2024-06-30"]),  # Starts exactly at end
+            "effective_to": pd.to_datetime(["2024-12-31"]),
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+        )
+
+        # No expires (no overlap, just adjacent)
+        assert len(result.expires) == 0
+
+        # Should insert the new adjacent record
+        assert len(result.inserts) == 1
+
+    def test_append_head_overlapping(self):
+        """Update at the start of existing record (overlapping) should slice."""
+        current = pd.DataFrame({
+            "id": ["A"],
+            "value": [100],
+            "effective_from": pd.to_datetime(["2024-06-01"]),
+            "effective_to": pd.to_datetime(["2024-12-31"]),
+            "as_of_from": pd.to_datetime(["2024-06-01"]),
+            "as_of_to": pd.Series([pd.NaT]),
+        })
+
+        updates = pd.DataFrame({
+            "id": ["A"],
+            "value": [200],
+            "effective_from": pd.to_datetime(["2024-01-01"]),  # Starts before
+            "effective_to": pd.to_datetime(["2024-09-01"]),    # Ends in middle
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+        )
+
+        # Original should expire
+        assert len(result.expires) == 1
+
+        # Should have 2 segments: update, remainder of original
+        assert len(result.inserts) == 2
+
+        inserts = result.inserts.sort_values("effective_from").reset_index(drop=True)
+        assert inserts.iloc[0]["value"] == 200  # Update
+        assert inserts.iloc[1]["value"] == 100  # Original after update
+
+    def test_append_head_exact_adjacent(self):
+        """Update exactly adjacent to start of existing (no overlap) should just insert."""
+        current = pd.DataFrame({
+            "id": ["A"],
+            "value": [100],
+            "effective_from": pd.to_datetime(["2024-06-01"]),
+            "effective_to": pd.to_datetime(["2024-12-31"]),
+            "as_of_from": pd.to_datetime(["2024-06-01"]),
+            "as_of_to": pd.Series([pd.NaT]),
+        })
+
+        updates = pd.DataFrame({
+            "id": ["A"],
+            "value": [200],
+            "effective_from": pd.to_datetime(["2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-06-01"]),  # Ends exactly at start
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+        )
+
+        # No expires (no overlap, just adjacent)
+        assert len(result.expires) == 0
+
+        # Should insert the new adjacent record
+        assert len(result.inserts) == 1
+
+
+class TestComplexScenarios:
+    """Tests for complex update scenarios from pytemporal."""
+
+    def test_overlay_multiple_records(self):
+        """Update spanning multiple consecutive current records should slice all."""
+        current = pd.DataFrame({
+            "id": ["A", "A", "A"],
+            "value": [100, 200, 300],
+            "effective_from": pd.to_datetime(["2024-01-01", "2024-04-01", "2024-07-01"]),
+            "effective_to": pd.to_datetime(["2024-04-01", "2024-07-01", "2024-12-31"]),
+            "as_of_from": pd.to_datetime(["2024-01-01", "2024-01-01", "2024-01-01"]),
+            "as_of_to": pd.Series([pd.NaT, pd.NaT, pd.NaT]),
+        })
+
+        updates = pd.DataFrame({
+            "id": ["A"],
+            "value": [999],
+            "effective_from": pd.to_datetime(["2024-03-01"]),  # Starts in first
+            "effective_to": pd.to_datetime(["2024-09-01"]),    # Ends in third
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+        )
+
+        # All 3 original records should expire
+        assert len(result.expires) == 3
+
+        # Should have: before update (100), update (999), after update (300)
+        assert len(result.inserts) == 3
+
+        inserts = result.inserts.sort_values("effective_from").reset_index(drop=True)
+        assert inserts.iloc[0]["value"] == 100  # First part of original
+        assert inserts.iloc[1]["value"] == 999  # Update
+        assert inserts.iloc[2]["value"] == 300  # Last part of original
+
+    def test_multi_intersection_single_point(self):
+        """Multiple updates on a single current record."""
+        current = pd.DataFrame({
+            "id": ["A"],
+            "value": [100],
+            "effective_from": pd.to_datetime(["2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-12-31"]),
+            "as_of_from": pd.to_datetime(["2024-01-01"]),
+            "as_of_to": pd.Series([pd.NaT]),
+        })
+
+        updates = pd.DataFrame({
+            "id": ["A", "A", "A"],
+            "value": [200, 300, 400],
+            "effective_from": pd.to_datetime(["2024-03-01", "2024-05-01", "2024-07-01"]),
+            "effective_to": pd.to_datetime(["2024-05-01", "2024-07-01", "2024-09-01"]),
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+        )
+
+        assert len(result.expires) == 1
+
+        # Should have 5 segments: original, update1, update2, update3, original tail
+        assert len(result.inserts) == 5
+
+        inserts = result.inserts.sort_values("effective_from").reset_index(drop=True)
+        assert inserts.iloc[0]["value"] == 100  # [2024-01-01, 2024-03-01)
+        assert inserts.iloc[1]["value"] == 200  # [2024-03-01, 2024-05-01)
+        assert inserts.iloc[2]["value"] == 300  # [2024-05-01, 2024-07-01)
+        assert inserts.iloc[3]["value"] == 400  # [2024-07-01, 2024-09-01)
+        assert inserts.iloc[4]["value"] == 100  # [2024-09-01, 2024-12-31)
+
+    def test_multi_intersection_multiple_points(self):
+        """Multiple updates across multiple current records."""
+        current = pd.DataFrame({
+            "id": ["A", "A"],
+            "value": [100, 200],
+            "effective_from": pd.to_datetime(["2024-01-01", "2024-07-01"]),
+            "effective_to": pd.to_datetime(["2024-07-01", "2024-12-31"]),
+            "as_of_from": pd.to_datetime(["2024-01-01", "2024-01-01"]),
+            "as_of_to": pd.Series([pd.NaT, pd.NaT]),
+        })
+
+        updates = pd.DataFrame({
+            "id": ["A", "A", "A"],
+            "value": [300, 400, 500],
+            "effective_from": pd.to_datetime(["2024-03-01", "2024-05-01", "2024-08-01"]),
+            "effective_to": pd.to_datetime(["2024-05-01", "2024-08-01", "2024-10-01"]),
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+        )
+
+        assert len(result.expires) == 2
+
+        # [01-01 to 03-01 val=100], [03-01 to 05-01 val=300],
+        # [05-01 to 08-01 val=400], [08-01 to 10-01 val=500], [10-01 to 12-31 val=200]
+        assert len(result.inserts) == 5
+
+    def test_multi_field_updates(self):
+        """Updates to different ID fields should be independent."""
+        current = pd.DataFrame({
+            "id": ["A", "A"],
+            "field": ["f1", "f2"],
+            "value": [100, 200],
+            "effective_from": pd.to_datetime(["2024-01-01", "2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-12-31", "2024-12-31"]),
+            "as_of_from": pd.to_datetime(["2024-01-01", "2024-01-01"]),
+            "as_of_to": pd.Series([pd.NaT, pd.NaT]),
+        })
+
+        updates = pd.DataFrame({
+            "id": ["A", "A"],
+            "field": ["f1", "f2"],
+            "value": [300, 400],
+            "effective_from": pd.to_datetime(["2024-03-01", "2024-06-01"]),
+            "effective_to": pd.to_datetime(["2024-09-01", "2024-09-01"]),
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id", "field"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+        )
+
+        # Both original records should expire
+        assert len(result.expires) == 2
+
+        # f1: [01-01 to 03-01], [03-01 to 09-01], [09-01 to 12-31] = 3 inserts
+        # f2: [01-01 to 06-01], [06-01 to 09-01], [09-01 to 12-31] = 3 inserts
+        assert len(result.inserts) == 6
+
+    def test_extend_current_row_same_value_adjacent(self):
+        """Adjacent update with same value should extend (merge) the record."""
+        current = pd.DataFrame({
+            "id": ["A"],
+            "value": [100],
+            "effective_from": pd.to_datetime(["2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-06-01"]),
+            "as_of_from": pd.to_datetime(["2024-01-01"]),
+            "as_of_to": pd.Series([pd.NaT]),
+        })
+
+        updates = pd.DataFrame({
+            "id": ["A"],
+            "value": [100],  # Same value
+            "effective_from": pd.to_datetime(["2024-06-01"]),  # Adjacent
+            "effective_to": pd.to_datetime(["2024-12-31"]),
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+        )
+
+        # Original should expire (to be merged)
+        assert len(result.expires) == 1
+
+        # Should produce single merged record
+        assert len(result.inserts) == 1
+
+        merged = result.inserts.iloc[0]
+        assert pd.Timestamp(merged["effective_from"]).date() == pd.Timestamp("2024-01-01").date()
+        assert pd.Timestamp(merged["effective_to"]).date() == pd.Timestamp("2024-12-31").date()
+
+    def test_extend_update_same_value_adjacent(self):
+        """Update extending before current with same value should merge."""
+        current = pd.DataFrame({
+            "id": ["A"],
+            "value": [100],
+            "effective_from": pd.to_datetime(["2024-06-01"]),
+            "effective_to": pd.to_datetime(["2024-12-31"]),
+            "as_of_from": pd.to_datetime(["2024-06-01"]),
+            "as_of_to": pd.Series([pd.NaT]),
+        })
+
+        updates = pd.DataFrame({
+            "id": ["A"],
+            "value": [100],  # Same value
+            "effective_from": pd.to_datetime(["2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-06-01"]),  # Adjacent to current
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+        )
+
+        # Original should expire (to be merged)
+        assert len(result.expires) == 1
+
+        # Should produce single merged record
+        assert len(result.inserts) == 1
+
+        merged = result.inserts.iloc[0]
+        assert pd.Timestamp(merged["effective_from"]).date() == pd.Timestamp("2024-01-01").date()
+        assert pd.Timestamp(merged["effective_to"]).date() == pd.Timestamp("2024-12-31").date()
+
+    def test_no_change_with_full_overlap_same_value(self):
+        """Update fully contained within current with same value should be no-op."""
+        current = pd.DataFrame({
+            "id": ["A"],
+            "value": [100],
+            "effective_from": pd.to_datetime(["2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-12-31"]),
+            "as_of_from": pd.to_datetime(["2024-01-01"]),
+            "as_of_to": pd.Series([pd.NaT]),
+        })
+
+        updates = pd.DataFrame({
+            "id": ["A"],
+            "value": [100],  # Same value
+            "effective_from": pd.to_datetime(["2024-03-01"]),  # Fully within
+            "effective_to": pd.to_datetime(["2024-09-01"]),
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+        )
+
+        # Should be effectively a no-op
+        if len(result.expires) == 0:
+            assert len(result.inserts) == 0
+        else:
+            # Or reconstructs the same record
+            assert len(result.inserts) == 1
+            assert pd.Timestamp(result.inserts.iloc[0]["effective_from"]) == pd.Timestamp("2024-01-01")
+            assert pd.Timestamp(result.inserts.iloc[0]["effective_to"]) == pd.Timestamp("2024-12-31")
+
+
+class TestConflationScenarios:
+    """Tests for conflation (merging adjacent same-value segments) scenarios."""
+
+    def test_conflation_three_consecutive_segments(self):
+        """Three consecutive segments with same values should merge into one."""
+        # Use non-empty current to avoid chdb empty DataFrame issue
+        current = pd.DataFrame({
+            "id": ["Z"],  # Different ID, no overlap
+            "value": [999],
+            "effective_from": pd.to_datetime(["2020-01-01"]),
+            "effective_to": pd.to_datetime(["2020-12-31"]),
+            "as_of_from": pd.to_datetime(["2020-01-01"]),
+            "as_of_to": pd.Series([pd.NaT]),
+        })
+
+        # Three adjacent updates with same value
+        updates = pd.DataFrame({
+            "id": ["A", "A", "A"],
+            "value": [100, 100, 100],
+            "effective_from": pd.to_datetime(["2024-01-01", "2024-04-01", "2024-07-01"]),
+            "effective_to": pd.to_datetime(["2024-04-01", "2024-07-01", "2024-10-01"]),
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+        )
+
+        # Should merge into one record (for ID A)
+        inserts_a = result.inserts[result.inserts["id"] == "A"]
+        assert len(inserts_a) == 1
+
+        merged = inserts_a.iloc[0]
+        assert pd.Timestamp(merged["effective_from"]).date() == pd.Timestamp("2024-01-01").date()
+        assert pd.Timestamp(merged["effective_to"]).date() == pd.Timestamp("2024-10-01").date()
+
+    def test_conflation_partial(self):
+        """Some segments merge, others don't due to value changes."""
+        # Use non-empty current to avoid chdb empty DataFrame issue
+        current = pd.DataFrame({
+            "id": ["Z"],
+            "value": [999],
+            "effective_from": pd.to_datetime(["2020-01-01"]),
+            "effective_to": pd.to_datetime(["2020-12-31"]),
+            "as_of_from": pd.to_datetime(["2020-01-01"]),
+            "as_of_to": pd.Series([pd.NaT]),
+        })
+
+        updates = pd.DataFrame({
+            "id": ["A", "A", "A", "A"],
+            "value": [100, 100, 200, 200],  # First two same, last two same but different
+            "effective_from": pd.to_datetime(["2024-01-01", "2024-04-01", "2024-07-01", "2024-10-01"]),
+            "effective_to": pd.to_datetime(["2024-04-01", "2024-07-01", "2024-10-01", "2024-12-31"]),
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+        )
+
+        # Should have 2 merged records for ID A
+        inserts_a = result.inserts[result.inserts["id"] == "A"].sort_values("effective_from").reset_index(drop=True)
+        assert len(inserts_a) == 2
+
+        assert inserts_a.iloc[0]["value"] == 100
+        assert pd.Timestamp(inserts_a.iloc[0]["effective_to"]).date() == pd.Timestamp("2024-07-01").date()
+        assert inserts_a.iloc[1]["value"] == 200
+        assert pd.Timestamp(inserts_a.iloc[1]["effective_from"]).date() == pd.Timestamp("2024-07-01").date()
+
+    def test_conflation_non_consecutive_no_merge(self):
+        """Segments with gaps should NOT merge even with same values."""
+        # Use non-empty current to avoid chdb empty DataFrame issue
+        current = pd.DataFrame({
+            "id": ["Z"],
+            "value": [999],
+            "effective_from": pd.to_datetime(["2020-01-01"]),
+            "effective_to": pd.to_datetime(["2020-12-31"]),
+            "as_of_from": pd.to_datetime(["2020-01-01"]),
+            "as_of_to": pd.Series([pd.NaT]),
+        })
+
+        updates = pd.DataFrame({
+            "id": ["A", "A"],
+            "value": [100, 100],  # Same value but with gap
+            "effective_from": pd.to_datetime(["2024-01-01", "2024-07-01"]),  # Gap from 04-01 to 07-01
+            "effective_to": pd.to_datetime(["2024-04-01", "2024-10-01"]),
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+        )
+
+        # Should remain as two separate records (gap prevents merge)
+        inserts_a = result.inserts[result.inserts["id"] == "A"]
+        assert len(inserts_a) == 2
+
+    def test_conflation_unsorted_input(self):
+        """Unsorted input should still conflate correctly."""
+        # Use non-empty current to avoid chdb empty DataFrame issue
+        current = pd.DataFrame({
+            "id": ["Z"],
+            "value": [999],
+            "effective_from": pd.to_datetime(["2020-01-01"]),
+            "effective_to": pd.to_datetime(["2020-12-31"]),
+            "as_of_from": pd.to_datetime(["2020-01-01"]),
+            "as_of_to": pd.Series([pd.NaT]),
+        })
+
+        # Out of order input
+        updates = pd.DataFrame({
+            "id": ["A", "A", "A"],
+            "value": [100, 100, 100],
+            "effective_from": pd.to_datetime(["2024-07-01", "2024-01-01", "2024-04-01"]),  # Unsorted
+            "effective_to": pd.to_datetime(["2024-10-01", "2024-04-01", "2024-07-01"]),
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+        )
+
+        # Should merge into one record
+        inserts_a = result.inserts[result.inserts["id"] == "A"]
+        assert len(inserts_a) == 1
+
+        merged = inserts_a.iloc[0]
+        assert pd.Timestamp(merged["effective_from"]).date() == pd.Timestamp("2024-01-01").date()
+        assert pd.Timestamp(merged["effective_to"]).date() == pd.Timestamp("2024-10-01").date()
+
+    def test_conflation_different_ids_no_cross_merge(self):
+        """Same values but different IDs should NOT merge across IDs."""
+        # Use non-empty current to avoid chdb empty DataFrame issue
+        current = pd.DataFrame({
+            "id": ["Z"],
+            "value": [999],
+            "effective_from": pd.to_datetime(["2020-01-01"]),
+            "effective_to": pd.to_datetime(["2020-12-31"]),
+            "as_of_from": pd.to_datetime(["2020-01-01"]),
+            "as_of_to": pd.Series([pd.NaT]),
+        })
+
+        updates = pd.DataFrame({
+            "id": ["A", "A", "B", "B"],
+            "value": [100, 100, 100, 100],  # All same value
+            "effective_from": pd.to_datetime(["2024-01-01", "2024-04-01", "2024-01-01", "2024-04-01"]),
+            "effective_to": pd.to_datetime(["2024-04-01", "2024-07-01", "2024-04-01", "2024-07-01"]),
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+        )
+
+        # Should have 2 records (one merged for A, one merged for B)
+        inserts_a = result.inserts[result.inserts["id"] == "A"]
+        inserts_b = result.inserts[result.inserts["id"] == "B"]
+
+        assert len(inserts_a) == 1
+        assert len(inserts_b) == 1
+
+
+class TestSliceScenarios:
+    """Tests for head/tail slice scenarios from pytemporal."""
+
+    def test_head_slice(self):
+        """Update starting before current should slice the head."""
+        current = pd.DataFrame({
+            "id": ["A"],
+            "field": ["test"],
+            "value": [100],
+            "effective_from": pd.to_datetime(["2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-12-31"]),
+            "as_of_from": pd.to_datetime(["2024-01-01"]),
+            "as_of_to": pd.Series([pd.NaT]),
+        })
+
+        updates = pd.DataFrame({
+            "id": ["A"],
+            "field": ["test"],
+            "value": [200],
+            "effective_from": pd.to_datetime(["2023-06-01"]),  # Before current
+            "effective_to": pd.to_datetime(["2024-06-01"]),    # Ends in middle of current
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id", "field"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+        )
+
+        assert len(result.expires) == 1
+        assert len(result.inserts) == 2
+
+        inserts = result.inserts.sort_values("effective_from").reset_index(drop=True)
+        # Update covers [2023-06-01, 2024-06-01)
+        assert pd.Timestamp(inserts.iloc[0]["effective_from"]).date() == pd.Timestamp("2023-06-01").date()
+        assert pd.Timestamp(inserts.iloc[0]["effective_to"]).date() == pd.Timestamp("2024-06-01").date()
+        assert inserts.iloc[0]["value"] == 200
+
+        # Remainder covers [2024-06-01, 2024-12-31)
+        assert pd.Timestamp(inserts.iloc[1]["effective_from"]).date() == pd.Timestamp("2024-06-01").date()
+        assert pd.Timestamp(inserts.iloc[1]["effective_to"]).date() == pd.Timestamp("2024-12-31").date()
+        assert inserts.iloc[1]["value"] == 100
+
+    def test_tail_slice(self):
+        """Update ending after current should slice the tail."""
+        current = pd.DataFrame({
+            "id": ["A"],
+            "field": ["test"],
+            "value": [100],
+            "effective_from": pd.to_datetime(["2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-12-31"]),
+            "as_of_from": pd.to_datetime(["2024-01-01"]),
+            "as_of_to": pd.Series([pd.NaT]),
+        })
+
+        updates = pd.DataFrame({
+            "id": ["A"],
+            "field": ["test"],
+            "value": [200],
+            "effective_from": pd.to_datetime(["2024-06-01"]),  # Starts in middle
+            "effective_to": pd.to_datetime(["2025-06-01"]),    # After current
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id", "field"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+        )
+
+        assert len(result.expires) == 1
+        assert len(result.inserts) == 2
+
+        inserts = result.inserts.sort_values("effective_from").reset_index(drop=True)
+        # Original covers [2024-01-01, 2024-06-01)
+        assert pd.Timestamp(inserts.iloc[0]["effective_from"]).date() == pd.Timestamp("2024-01-01").date()
+        assert pd.Timestamp(inserts.iloc[0]["effective_to"]).date() == pd.Timestamp("2024-06-01").date()
+        assert inserts.iloc[0]["value"] == 100
+
+        # Update covers [2024-06-01, 2025-06-01)
+        assert pd.Timestamp(inserts.iloc[1]["effective_from"]).date() == pd.Timestamp("2024-06-01").date()
+        assert pd.Timestamp(inserts.iloc[1]["effective_to"]).date() == pd.Timestamp("2025-06-01").date()
+        assert inserts.iloc[1]["value"] == 200
+
+    def test_total_overwrite(self):
+        """Update fully covering current should replace it entirely."""
+        current = pd.DataFrame({
+            "id": ["A"],
+            "field": ["test"],
+            "value": [100],
+            "effective_from": pd.to_datetime(["2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-12-31"]),
+            "as_of_from": pd.to_datetime(["2024-01-01"]),
+            "as_of_to": pd.Series([pd.NaT]),
+        })
+
+        updates = pd.DataFrame({
+            "id": ["A"],
+            "field": ["test"],
+            "value": [200],
+            "effective_from": pd.to_datetime(["2023-01-01"]),  # Before current
+            "effective_to": pd.to_datetime(["2025-12-31"]),    # After current
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id", "field"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+        )
+
+        assert len(result.expires) == 1
+        assert len(result.inserts) == 1
+
+        insert = result.inserts.iloc[0]
+        assert pd.Timestamp(insert["effective_from"]).date() == pd.Timestamp("2023-01-01").date()
+        assert pd.Timestamp(insert["effective_to"]).date() == pd.Timestamp("2025-12-31").date()
+        assert insert["value"] == 200
+
+    def test_update_multiple_current_records(self):
+        """Single update spanning multiple current records."""
+        current = pd.DataFrame({
+            "id": ["A", "A", "A"],
+            "field": ["test", "test", "test"],
+            "value": [100, 200, 300],
+            "effective_from": pd.to_datetime(["2024-01-01", "2024-05-01", "2024-09-01"]),
+            "effective_to": pd.to_datetime(["2024-05-01", "2024-09-01", "2024-12-31"]),
+            "as_of_from": pd.to_datetime(["2024-01-01", "2024-01-01", "2024-01-01"]),
+            "as_of_to": pd.Series([pd.NaT, pd.NaT, pd.NaT]),
+        })
+
+        updates = pd.DataFrame({
+            "id": ["A"],
+            "field": ["test"],
+            "value": [999],
+            "effective_from": pd.to_datetime(["2024-04-01"]),  # In first
+            "effective_to": pd.to_datetime(["2024-10-01"]),    # In third
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id", "field"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+        )
+
+        # All 3 original records should expire
+        assert len(result.expires) == 3
+
+        # [01-01 to 04-01 val=100], [04-01 to 10-01 val=999], [10-01 to 12-31 val=300]
+        assert len(result.inserts) == 3
+
+        inserts = result.inserts.sort_values("effective_from").reset_index(drop=True)
+        assert inserts.iloc[0]["value"] == 100
+        assert inserts.iloc[1]["value"] == 999
+        assert inserts.iloc[2]["value"] == 300
+
+    def test_two_updates_same_id(self):
+        """Two non-overlapping updates for same ID."""
+        current = pd.DataFrame({
+            "id": ["A"],
+            "field": ["test"],
+            "value": [100],
+            "effective_from": pd.to_datetime(["2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-12-31"]),
+            "as_of_from": pd.to_datetime(["2024-01-01"]),
+            "as_of_to": pd.Series([pd.NaT]),
+        })
+
+        updates = pd.DataFrame({
+            "id": ["A", "A"],
+            "field": ["test", "test"],
+            "value": [200, 300],
+            "effective_from": pd.to_datetime(["2024-03-01", "2024-06-01"]),
+            "effective_to": pd.to_datetime(["2024-05-01", "2024-09-01"]),
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id", "field"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+        )
+
+        assert len(result.expires) == 1
+
+        # [01-01 to 03-01 val=100], [03-01 to 05-01 val=200],
+        # [05-01 to 06-01 val=100], [06-01 to 09-01 val=300], [09-01 to 12-31 val=100]
+        assert len(result.inserts) == 5
