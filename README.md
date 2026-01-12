@@ -102,12 +102,18 @@ Tested with 500k current state rows (125k ID groups, 4 records each) and 300k up
 
 | Metric | Value |
 |--------|-------|
-| Computation time | 1.53s |
-| Throughput | 521,543 rows/sec |
-| Records expired | 215,400 |
-| Records inserted | 504,600 |
+| Computation time | ~0.27s |
+| Throughput | ~3M rows/sec |
+| Records expired | ~197k |
+| Records inserted | ~630k |
 
 Update mix: 40% overlapping, 20% adjacent same-value, 20% same-value no-op, 20% new IDs.
+
+### Implementation Notes
+
+The library uses chdb's temporary tables with the `Python()` table function for zero-copy DataFrame access. This approach is ~18% faster than writing to temporary Parquet files.
+
+One quirk: `pd.NaT` values must be converted to `None` before insertion, as chdb's `Python()` function converts NaT to an invalid date rather than NULL. This conversion is handled automatically by the library.
 
 ## Running tests
 
