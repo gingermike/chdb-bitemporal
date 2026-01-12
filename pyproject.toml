@@ -1,0 +1,14 @@
+[project]
+name = "timeseries-chdb"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "chdb>=3.7.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
