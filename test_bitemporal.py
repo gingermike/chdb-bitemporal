@@ -1603,3 +1603,290 @@ class TestSliceScenarios:
         # [01-01 to 03-01 val=100], [03-01 to 05-01 val=200],
         # [05-01 to 06-01 val=100], [06-01 to 09-01 val=300], [09-01 to 12-31 val=100]
         assert len(result.inserts) == 5
+
+
+class TestFullStateMode:
+    """Tests for full_state (flush and fill) update mode with tombstoning."""
+
+    def test_full_state_basic_update_and_insert(self):
+        """Basic full_state: update existing + insert new record."""
+        current = pd.DataFrame({
+            "id": ["A", "B"],
+            "value": [100, 200],
+            "effective_from": pd.to_datetime(["2024-01-01", "2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-06-30", "2024-06-30"]),
+            "as_of_from": pd.to_datetime(["2024-01-01", "2024-01-01"]),
+            "as_of_to": pd.Series([pd.NaT, pd.NaT]),
+        })
+
+        # Updates contain A (modified) and C (new), but NOT B
+        updates = pd.DataFrame({
+            "id": ["A", "C"],
+            "value": [150, 300],  # A is modified, C is new
+            "effective_from": pd.to_datetime(["2024-01-01", "2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-06-30", "2024-06-30"]),
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+            update_mode="full_state",
+        )
+
+        # B should be expired (tombstoned) + A should be expired (modified)
+        assert len(result.expires) == 2
+
+        # A (updated) + C (new) + B (tombstone with truncated effective_to)
+        assert len(result.inserts) == 3
+
+        # Verify B got tombstoned
+        tombstone_b = result.inserts[result.inserts["id"] == "B"]
+        assert len(tombstone_b) == 1
+        assert pd.Timestamp(tombstone_b.iloc[0]["effective_to"]).date() == pd.Timestamp("2024-05-15").date()
+
+    def test_full_state_delete_missing_record(self):
+        """Full_state: records not in updates get tombstoned."""
+        current = pd.DataFrame({
+            "id": ["A", "B"],
+            "value": [100, 200],
+            "effective_from": pd.to_datetime(["2024-01-01", "2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-12-31", "2024-12-31"]),
+            "as_of_from": pd.to_datetime(["2024-01-01", "2024-01-01"]),
+            "as_of_to": pd.Series([pd.NaT, pd.NaT]),
+        })
+
+        # Only A in updates, B should get tombstoned
+        updates = pd.DataFrame({
+            "id": ["A"],
+            "value": [150],
+            "effective_from": pd.to_datetime(["2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-06-30"]),
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+            update_mode="full_state",
+        )
+
+        # A expired (modified) + B expired (tombstoned)
+        assert len(result.expires) == 2
+
+        # Verify B was tombstoned
+        expires_b = result.expires[result.expires["id"] == "B"]
+        assert len(expires_b) == 1
+
+        # B's tombstone in inserts should have effective_to = system_date
+        tombstone_b = result.inserts[result.inserts["id"] == "B"]
+        assert len(tombstone_b) == 1
+        assert pd.Timestamp(tombstone_b.iloc[0]["effective_to"]).date() == pd.Timestamp("2024-05-15").date()
+
+    def test_full_state_no_change_same_values(self):
+        """Full_state: same values should result in no change for that record."""
+        current = pd.DataFrame({
+            "id": ["A"],
+            "value": [100],
+            "effective_from": pd.to_datetime(["2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-06-30"]),
+            "as_of_from": pd.to_datetime(["2024-01-01"]),
+            "as_of_to": pd.Series([pd.NaT]),
+        })
+
+        # Exact same record
+        updates = pd.DataFrame({
+            "id": ["A"],
+            "value": [100],
+            "effective_from": pd.to_datetime(["2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-06-30"]),
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+            update_mode="full_state",
+        )
+
+        # No changes needed
+        assert len(result.expires) == 0
+        assert len(result.inserts) == 0
+
+    def test_full_state_multiple_ids_tombstoned(self):
+        """Full_state: multiple IDs can be tombstoned at once."""
+        current = pd.DataFrame({
+            "id": ["A", "B", "C", "D"],
+            "value": [100, 200, 300, 400],
+            "effective_from": pd.to_datetime(["2024-01-01"] * 4),
+            "effective_to": pd.to_datetime(["2024-12-31"] * 4),
+            "as_of_from": pd.to_datetime(["2024-01-01"] * 4),
+            "as_of_to": pd.Series([pd.NaT] * 4),
+        })
+
+        # Only A and D in updates, B and C should be tombstoned
+        updates = pd.DataFrame({
+            "id": ["A", "D"],
+            "value": [100, 400],  # Same values
+            "effective_from": pd.to_datetime(["2024-01-01", "2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-12-31", "2024-12-31"]),
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+            update_mode="full_state",
+        )
+
+        # B and C should be expired (tombstoned)
+        assert len(result.expires) == 2
+
+        expired_ids = set(result.expires["id"].tolist())
+        assert expired_ids == {"B", "C"}
+
+        # B and C tombstones in inserts
+        assert len(result.inserts) == 2
+        insert_ids = set(result.inserts["id"].tolist())
+        assert insert_ids == {"B", "C"}
+
+    def test_full_state_composite_id(self):
+        """Full_state with composite ID columns."""
+        current = pd.DataFrame({
+            "id": ["A", "A", "B"],
+            "field": ["f1", "f2", "f1"],
+            "value": [100, 200, 300],
+            "effective_from": pd.to_datetime(["2024-01-01"] * 3),
+            "effective_to": pd.to_datetime(["2024-12-31"] * 3),
+            "as_of_from": pd.to_datetime(["2024-01-01"] * 3),
+            "as_of_to": pd.Series([pd.NaT] * 3),
+        })
+
+        # Only (A, f1) in updates; (A, f2) and (B, f1) should be tombstoned
+        updates = pd.DataFrame({
+            "id": ["A"],
+            "field": ["f1"],
+            "value": [100],  # Same value
+            "effective_from": pd.to_datetime(["2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-12-31"]),
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id", "field"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+            update_mode="full_state",
+        )
+
+        # (A, f2) and (B, f1) should be expired
+        assert len(result.expires) == 2
+
+        # (A, f2) and (B, f1) tombstones
+        assert len(result.inserts) == 2
+
+    def test_full_state_conflation_on_updates(self):
+        """Full_state should still apply conflation to incoming updates."""
+        current = pd.DataFrame({
+            "id": ["Z"],  # Different ID, will be tombstoned
+            "value": [999],
+            "effective_from": pd.to_datetime(["2020-01-01"]),
+            "effective_to": pd.to_datetime(["2020-12-31"]),
+            "as_of_from": pd.to_datetime(["2020-01-01"]),
+            "as_of_to": pd.Series([pd.NaT]),
+        })
+
+        # Adjacent updates with same value should be conflated
+        updates = pd.DataFrame({
+            "id": ["A", "A", "A"],
+            "value": [100, 100, 100],
+            "effective_from": pd.to_datetime(["2024-01-01", "2024-04-01", "2024-07-01"]),
+            "effective_to": pd.to_datetime(["2024-04-01", "2024-07-01", "2024-10-01"]),
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+            update_mode="full_state",
+        )
+
+        # Z should be expired (tombstoned)
+        assert len(result.expires) == 1
+        assert result.expires.iloc[0]["id"] == "Z"
+
+        # A should be conflated into one record + Z tombstone
+        inserts_a = result.inserts[result.inserts["id"] == "A"]
+        assert len(inserts_a) == 1
+
+        merged = inserts_a.iloc[0]
+        assert pd.Timestamp(merged["effective_from"]).date() == pd.Timestamp("2024-01-01").date()
+        assert pd.Timestamp(merged["effective_to"]).date() == pd.Timestamp("2024-10-01").date()
+
+    def test_delta_mode_no_tombstones(self):
+        """Delta mode (default) should NOT tombstone missing IDs."""
+        current = pd.DataFrame({
+            "id": ["A", "B"],
+            "value": [100, 200],
+            "effective_from": pd.to_datetime(["2024-01-01", "2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-12-31", "2024-12-31"]),
+            "as_of_from": pd.to_datetime(["2024-01-01", "2024-01-01"]),
+            "as_of_to": pd.Series([pd.NaT, pd.NaT]),
+        })
+
+        # Only A in updates, B should NOT be tombstoned in delta mode
+        updates = pd.DataFrame({
+            "id": ["A"],
+            "value": [150],
+            "effective_from": pd.to_datetime(["2024-03-01"]),
+            "effective_to": pd.to_datetime(["2024-09-01"]),
+        })
+
+        result = compute_changes(
+            current, updates,
+            id_columns=["id"],
+            value_columns=["value"],
+            system_date=pd.Timestamp("2024-05-15"),
+            update_mode="delta",  # Explicit delta mode
+        )
+
+        # Only A should be expired (modified), NOT B
+        assert len(result.expires) == 1
+        assert result.expires.iloc[0]["id"] == "A"
+
+        # B should NOT appear in inserts
+        inserts_b = result.inserts[result.inserts["id"] == "B"]
+        assert len(inserts_b) == 0
+
+    def test_invalid_update_mode_raises(self):
+        """Invalid update_mode should raise ValueError."""
+        current = pd.DataFrame({
+            "id": ["A"],
+            "value": [100],
+            "effective_from": pd.to_datetime(["2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-12-31"]),
+            "as_of_from": pd.to_datetime(["2024-01-01"]),
+            "as_of_to": pd.Series([pd.NaT]),
+        })
+
+        updates = pd.DataFrame({
+            "id": ["A"],
+            "value": [100],
+            "effective_from": pd.to_datetime(["2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-12-31"]),
+        })
+
+        import pytest
+        with pytest.raises(ValueError, match="update_mode must be"):
+            compute_changes(
+                current, updates,
+                id_columns=["id"],
+                value_columns=["value"],
+                system_date=pd.Timestamp("2024-05-15"),
+                update_mode="invalid",
+            )

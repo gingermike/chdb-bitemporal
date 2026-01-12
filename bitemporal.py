@@ -33,6 +33,7 @@ def compute_changes(
     id_columns: list[str],
     value_columns: list[str],
     system_date: pd.Timestamp | None = None,
+    update_mode: str = "delta",
 ) -> BitemporalChanges:
     """
     Compute bitemporal changes using timeline reconstruction.
@@ -45,10 +46,16 @@ def compute_changes(
         id_columns: Columns that identify a unique timeseries
         value_columns: Columns containing the actual data values
         system_date: System date for as_of timestamps (defaults to today)
+        update_mode: Either "delta" or "full_state"
+            - "delta": Updates overlay on current state (default)
+            - "full_state": Updates represent complete state; IDs in current
+              but not in updates get tombstoned (effective_to set to system_date)
 
     Returns:
         BitemporalChanges with expires and inserts DataFrames
     """
+    if update_mode not in ("delta", "full_state"):
+        raise ValueError(f"update_mode must be 'delta' or 'full_state', got '{update_mode}'")
     system_date = system_date or pd.Timestamp.today().normalize()
 
     # Convert NaT to None for proper NULL handling in temp tables
@@ -332,6 +339,94 @@ def compute_changes(
     # Execute queries using session
     expires_result = session.query(expires_query, "DataFrame")
     inserts_result = session.query(inserts_query, "DataFrame")
+
+    # Handle full_state mode: tombstone IDs that are in current but not in updates
+    if update_mode == "full_state":
+        # Query for tombstones: current records whose IDs don't appear in updates at all
+        tombstone_query = f"""
+        WITH
+        current_active AS (
+            SELECT
+                {id_cols_sql},
+                {value_cols_sql},
+                effective_from,
+                effective_to,
+                as_of_from
+            FROM current_state
+            WHERE as_of_to IS NULL
+        ),
+        update_ids AS (
+            SELECT DISTINCT {id_cols_sql}
+            FROM updates
+        ),
+        missing_ids AS (
+            SELECT DISTINCT {id_cols_sql}
+            FROM current_active
+            WHERE ({id_cols_sql}) NOT IN (SELECT {id_cols_sql} FROM update_ids)
+        )
+        SELECT
+            c.{id_cols_sql.replace(', ', ', c.')},
+            {', '.join([f'c.{v}' for v in value_columns])},
+            c.effective_from,
+            toDate('{system_date}') AS effective_to,
+            c.as_of_from,
+            CAST(NULL AS Nullable(Date)) AS as_of_to
+        FROM current_active c
+        WHERE ({', '.join([f'c.{col}' for col in id_columns])}) IN (
+            SELECT {id_cols_sql} FROM missing_ids
+        )
+        """
+
+        # Query for tombstone expires (original records to close)
+        tombstone_expires_query = f"""
+        WITH
+        current_active AS (
+            SELECT
+                {id_cols_sql},
+                {value_cols_sql},
+                effective_from,
+                effective_to,
+                as_of_from
+            FROM current_state
+            WHERE as_of_to IS NULL
+        ),
+        update_ids AS (
+            SELECT DISTINCT {id_cols_sql}
+            FROM updates
+        ),
+        missing_ids AS (
+            SELECT DISTINCT {id_cols_sql}
+            FROM current_active
+            WHERE ({id_cols_sql}) NOT IN (SELECT {id_cols_sql} FROM update_ids)
+        )
+        SELECT
+            c.{id_cols_sql.replace(', ', ', c.')},
+            {', '.join([f'c.{v}' for v in value_columns])},
+            c.effective_from,
+            c.effective_to,
+            c.as_of_from,
+            toDate('{system_date}') AS as_of_to
+        FROM current_active c
+        WHERE ({', '.join([f'c.{col}' for col in id_columns])}) IN (
+            SELECT {id_cols_sql} FROM missing_ids
+        )
+        """
+
+        tombstone_inserts = session.query(tombstone_query, "DataFrame")
+        tombstone_expires = session.query(tombstone_expires_query, "DataFrame")
+
+        # Combine with main results
+        if tombstone_inserts is not None and len(tombstone_inserts) > 0:
+            if inserts_result is not None and len(inserts_result) > 0:
+                inserts_result = pd.concat([inserts_result, tombstone_inserts], ignore_index=True)
+            else:
+                inserts_result = tombstone_inserts
+
+        if tombstone_expires is not None and len(tombstone_expires) > 0:
+            if expires_result is not None and len(expires_result) > 0:
+                expires_result = pd.concat([expires_result, tombstone_expires], ignore_index=True)
+            else:
+                expires_result = tombstone_expires
 
     return BitemporalChanges(
         expires=expires_result if expires_result is not None else pd.DataFrame(),
