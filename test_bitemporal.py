@@ -6,7 +6,6 @@ import pytest
 import pandas as pd
 import numpy as np
 import time
-from datetime import date, timedelta
 from bitemporal import compute_changes
 
 
@@ -18,29 +17,29 @@ class TestSimpleUpdates:
         current = pd.DataFrame({
             "id": ["A"],
             "value": [100],
-            "effective_from": [date(2024, 1, 1)],
-            "effective_to": [date(2024, 12, 31)],
-            "as_of_from": [date(2024, 1, 1)],
-            "as_of_to": [None],
+            "effective_from": pd.to_datetime(["2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-12-31"]),
+            "as_of_from": pd.to_datetime(["2024-01-01"]),
+            "as_of_to": pd.Series([pd.NaT]),
         })
 
         updates = pd.DataFrame({
             "id": ["A"],
             "value": [200],
-            "effective_from": [date(2024, 6, 1)],
-            "effective_to": [date(2024, 8, 31)],
+            "effective_from": pd.to_datetime(["2024-06-01"]),
+            "effective_to": pd.to_datetime(["2024-08-31"]),
         })
 
         result = compute_changes(
             current, updates,
             id_columns=["id"],
             value_columns=["value"],
-            system_date=date(2024, 5, 15),
+            system_date=pd.Timestamp("2024-05-15"),
         )
 
         # Original record should expire
         assert len(result.expires) == 1
-        assert result.expires.iloc[0]["as_of_to"] == date(2024, 5, 15)
+        assert pd.Timestamp(result.expires.iloc[0]["as_of_to"]) == pd.Timestamp("2024-05-15")
 
         # Should produce 3 new records
         assert len(result.inserts) == 3
@@ -48,18 +47,18 @@ class TestSimpleUpdates:
         inserts = result.inserts.sort_values("effective_from").reset_index(drop=True)
 
         # First segment: original value before update
-        assert inserts.iloc[0]["effective_from"] == date(2024, 1, 1)
-        assert inserts.iloc[0]["effective_to"] == date(2024, 6, 1)
+        assert pd.Timestamp(inserts.iloc[0]["effective_from"]).date() == pd.Timestamp("2024-01-01").date()
+        assert pd.Timestamp(inserts.iloc[0]["effective_to"]).date() == pd.Timestamp("2024-06-01").date()
         assert inserts.iloc[0]["value"] == 100
 
         # Second segment: update value
-        assert inserts.iloc[1]["effective_from"] == date(2024, 6, 1)
-        assert inserts.iloc[1]["effective_to"] == date(2024, 8, 31)
+        assert pd.Timestamp(inserts.iloc[1]["effective_from"]).date() == pd.Timestamp("2024-06-01").date()
+        assert pd.Timestamp(inserts.iloc[1]["effective_to"]).date() == pd.Timestamp("2024-08-31").date()
         assert inserts.iloc[1]["value"] == 200
 
         # Third segment: original value after update
-        assert inserts.iloc[2]["effective_from"] == date(2024, 8, 31)
-        assert inserts.iloc[2]["effective_to"] == date(2024, 12, 31)
+        assert pd.Timestamp(inserts.iloc[2]["effective_from"]).date() == pd.Timestamp("2024-08-31").date()
+        assert pd.Timestamp(inserts.iloc[2]["effective_to"]).date() == pd.Timestamp("2024-12-31").date()
         assert inserts.iloc[2]["value"] == 100
 
     def test_update_with_same_value_no_change(self):
@@ -67,24 +66,24 @@ class TestSimpleUpdates:
         current = pd.DataFrame({
             "id": ["A"],
             "value": [100],
-            "effective_from": [date(2024, 1, 1)],
-            "effective_to": [date(2024, 12, 31)],
-            "as_of_from": [date(2024, 1, 1)],
-            "as_of_to": [None],
+            "effective_from": pd.to_datetime(["2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-12-31"]),
+            "as_of_from": pd.to_datetime(["2024-01-01"]),
+            "as_of_to": pd.Series([pd.NaT]),
         })
 
         updates = pd.DataFrame({
             "id": ["A"],
             "value": [100],  # Same value
-            "effective_from": [date(2024, 3, 1)],
-            "effective_to": [date(2024, 6, 1)],
+            "effective_from": pd.to_datetime(["2024-03-01"]),
+            "effective_to": pd.to_datetime(["2024-06-01"]),
         })
 
         result = compute_changes(
             current, updates,
             id_columns=["id"],
             value_columns=["value"],
-            system_date=date(2024, 5, 15),
+            system_date=pd.Timestamp("2024-05-15"),
         )
 
         # No expires needed (or reconstruct same record)
@@ -94,8 +93,8 @@ class TestSimpleUpdates:
         else:
             # If it expires and reinserts, should be equivalent
             assert len(result.inserts) == 1
-            assert result.inserts.iloc[0]["effective_from"] == date(2024, 1, 1)
-            assert result.inserts.iloc[0]["effective_to"] == date(2024, 12, 31)
+            assert pd.Timestamp(result.inserts.iloc[0]["effective_from"]) == pd.Timestamp("2024-01-01")
+            assert pd.Timestamp(result.inserts.iloc[0]["effective_to"]) == pd.Timestamp("2024-12-31")
             assert result.inserts.iloc[0]["value"] == 100
 
 
@@ -107,25 +106,25 @@ class TestOverlappingUpdates:
         current = pd.DataFrame({
             "id": ["A"],
             "value": [100],
-            "effective_from": [date(2024, 1, 1)],
-            "effective_to": [date(2024, 12, 31)],
-            "as_of_from": [date(2024, 1, 1)],
-            "as_of_to": [None],
+            "effective_from": pd.to_datetime(["2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-12-31"]),
+            "as_of_from": pd.to_datetime(["2024-01-01"]),
+            "as_of_to": pd.Series([pd.NaT]),
         })
 
         # Two updates that overlap from May-July
         updates = pd.DataFrame({
             "id": ["A", "A"],
             "value": [200, 300],
-            "effective_from": [date(2024, 3, 1), date(2024, 5, 1)],
-            "effective_to": [date(2024, 7, 31), date(2024, 9, 30)],
+            "effective_from": pd.to_datetime(["2024-03-01", "2024-05-01"]),
+            "effective_to": pd.to_datetime(["2024-07-31", "2024-09-30"]),
         })
 
         result = compute_changes(
             current, updates,
             id_columns=["id"],
             value_columns=["value"],
-            system_date=date(2024, 5, 15),
+            system_date=pd.Timestamp("2024-05-15"),
         )
 
         assert len(result.expires) == 1
@@ -149,25 +148,25 @@ class TestOverlappingUpdates:
         current = pd.DataFrame({
             "id": ["A"],
             "value": [100],
-            "effective_from": [date(2024, 1, 1)],
-            "effective_to": [date(2024, 12, 31)],
-            "as_of_from": [date(2024, 1, 1)],
-            "as_of_to": [None],
+            "effective_from": pd.to_datetime(["2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-12-31"]),
+            "as_of_from": pd.to_datetime(["2024-01-01"]),
+            "as_of_to": pd.Series([pd.NaT]),
         })
 
         # Two adjacent updates with same value
         updates = pd.DataFrame({
             "id": ["A", "A"],
             "value": [200, 200],
-            "effective_from": [date(2024, 3, 1), date(2024, 6, 1)],
-            "effective_to": [date(2024, 6, 1), date(2024, 9, 1)],
+            "effective_from": pd.to_datetime(["2024-03-01", "2024-06-01"]),
+            "effective_to": pd.to_datetime(["2024-06-01", "2024-09-01"]),
         })
 
         result = compute_changes(
             current, updates,
             id_columns=["id"],
             value_columns=["value"],
-            system_date=date(2024, 5, 15),
+            system_date=pd.Timestamp("2024-05-15"),
         )
 
         # Should have 3 segments (merged middle)
@@ -176,8 +175,8 @@ class TestOverlappingUpdates:
         inserts = result.inserts.sort_values("effective_from").reset_index(drop=True)
 
         # Middle segment should be merged
-        assert inserts.iloc[1]["effective_from"] == date(2024, 3, 1)
-        assert inserts.iloc[1]["effective_to"] == date(2024, 9, 1)
+        assert pd.Timestamp(inserts.iloc[1]["effective_from"]).date() == pd.Timestamp("2024-03-01").date()
+        assert pd.Timestamp(inserts.iloc[1]["effective_to"]).date() == pd.Timestamp("2024-09-01").date()
         assert inserts.iloc[1]["value"] == 200
 
 
@@ -189,24 +188,24 @@ class TestMultipleIds:
         current = pd.DataFrame({
             "id": ["A", "B"],
             "value": [100, 500],
-            "effective_from": [date(2024, 1, 1), date(2024, 1, 1)],
-            "effective_to": [date(2024, 12, 31), date(2024, 12, 31)],
-            "as_of_from": [date(2024, 1, 1), date(2024, 1, 1)],
-            "as_of_to": [None, None],
+            "effective_from": pd.to_datetime(["2024-01-01", "2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-12-31", "2024-12-31"]),
+            "as_of_from": pd.to_datetime(["2024-01-01", "2024-01-01"]),
+            "as_of_to": pd.Series([pd.NaT, pd.NaT]),
         })
 
         updates = pd.DataFrame({
             "id": ["A", "B"],
             "value": [200, 600],
-            "effective_from": [date(2024, 6, 1), date(2024, 3, 1)],
-            "effective_to": [date(2024, 9, 1), date(2024, 6, 1)],
+            "effective_from": pd.to_datetime(["2024-06-01", "2024-03-01"]),
+            "effective_to": pd.to_datetime(["2024-09-01", "2024-06-01"]),
         })
 
         result = compute_changes(
             current, updates,
             id_columns=["id"],
             value_columns=["value"],
-            system_date=date(2024, 5, 15),
+            system_date=pd.Timestamp("2024-05-15"),
         )
 
         # Both original records should expire
@@ -225,25 +224,25 @@ class TestMultipleIds:
             "portfolio": ["P1", "P1"],
             "security": ["AAPL", "MSFT"],
             "quantity": [100, 200],
-            "effective_from": [date(2024, 1, 1), date(2024, 1, 1)],
-            "effective_to": [date(2024, 12, 31), date(2024, 12, 31)],
-            "as_of_from": [date(2024, 1, 1), date(2024, 1, 1)],
-            "as_of_to": [None, None],
+            "effective_from": pd.to_datetime(["2024-01-01", "2024-01-01"]),
+            "effective_to": pd.to_datetime(["2024-12-31", "2024-12-31"]),
+            "as_of_from": pd.to_datetime(["2024-01-01", "2024-01-01"]),
+            "as_of_to": pd.Series([pd.NaT, pd.NaT]),
         })
 
         updates = pd.DataFrame({
             "portfolio": ["P1"],
             "security": ["AAPL"],
             "quantity": [150],
-            "effective_from": [date(2024, 6, 1)],
-            "effective_to": [date(2024, 9, 1)],
+            "effective_from": pd.to_datetime(["2024-06-01"]),
+            "effective_to": pd.to_datetime(["2024-09-01"]),
         })
 
         result = compute_changes(
             current, updates,
             id_columns=["portfolio", "security"],
             value_columns=["quantity"],
-            system_date=date(2024, 5, 15),
+            system_date=pd.Timestamp("2024-05-15"),
         )
 
         # Only AAPL should expire
@@ -285,7 +284,7 @@ class TestPerformance:
         num_id_groups = 125_000  # Will give us 500k current rows
         num_updates = 300_000
 
-        base_date = date(2020, 1, 1)
+        base_date = pd.Timestamp("2020-01-01")
         days_per_record = 365  # Each record covers ~1 year
 
         print(f"\nGenerating test data...")
@@ -318,8 +317,8 @@ class TestPerformance:
                 current_securities.append(security)
                 current_quantities.append(100 * (j + 1) + i % 100)
                 current_prices.append(round(10.0 + j * 5.0 + (i % 50) * 0.1, 2))
-                current_from.append(base_date + timedelta(days=j * days_per_record))
-                current_to.append(base_date + timedelta(days=(j + 1) * days_per_record))
+                current_from.append(base_date + pd.Timedelta(days=j * days_per_record))
+                current_to.append(base_date + pd.Timedelta(days=(j + 1) * days_per_record))
 
         current_state = pd.DataFrame({
             "portfolio": current_portfolios,
@@ -329,7 +328,7 @@ class TestPerformance:
             "effective_from": current_from,
             "effective_to": current_to,
             "as_of_from": [base_date] * len(current_portfolios),
-            "as_of_to": [None] * len(current_portfolios),
+            "as_of_to": pd.Series([pd.NaT] * len(current_portfolios)),
         })
 
         # Generate updates with different scenarios
@@ -356,8 +355,8 @@ class TestPerformance:
             update_prices.append(round(999.0 - (i % 100) * 0.5, 2))
             # Overlap across record boundaries (e.g., days 300-500 crosses first two records)
             start_day = 300 + (i % 400)
-            update_from.append(base_date + timedelta(days=start_day))
-            update_to.append(base_date + timedelta(days=start_day + 200))
+            update_from.append(base_date + pd.Timedelta(days=start_day))
+            update_to.append(base_date + pd.Timedelta(days=start_day + 200))
 
         # 2. Adjacent same value - should trigger merging
         for i in range(n_adjacent_same):
@@ -369,11 +368,11 @@ class TestPerformance:
             update_prices.append(50.0)
             # Two adjacent ranges that should merge
             if i % 2 == 0:
-                update_from.append(base_date + timedelta(days=100))
-                update_to.append(base_date + timedelta(days=200))
+                update_from.append(base_date + pd.Timedelta(days=100))
+                update_to.append(base_date + pd.Timedelta(days=200))
             else:
-                update_from.append(base_date + timedelta(days=200))
-                update_to.append(base_date + timedelta(days=300))
+                update_from.append(base_date + pd.Timedelta(days=200))
+                update_to.append(base_date + pd.Timedelta(days=300))
 
         # 3. Same value updates - should produce minimal/no changes
         for i in range(n_same_value):
@@ -385,8 +384,8 @@ class TestPerformance:
             update_quantities.append(current_quantities[record_idx])
             update_prices.append(current_prices[record_idx])
             # Subset of first record's range
-            update_from.append(base_date + timedelta(days=50))
-            update_to.append(base_date + timedelta(days=200))
+            update_from.append(base_date + pd.Timedelta(days=50))
+            update_to.append(base_date + pd.Timedelta(days=200))
 
         # 4. New ID groups - IDs not in current state
         for i in range(n_new_ids):
@@ -395,8 +394,8 @@ class TestPerformance:
             update_securities.append(f"SECNEW{i:05d}")
             update_quantities.append(1000 + i % 500)
             update_prices.append(round(100.0 + (i % 100), 2))
-            update_from.append(base_date + timedelta(days=i % 1000))
-            update_to.append(base_date + timedelta(days=(i % 1000) + 365))
+            update_from.append(base_date + pd.Timedelta(days=i % 1000))
+            update_to.append(base_date + pd.Timedelta(days=(i % 1000) + 365))
 
         updates = pd.DataFrame({
             "portfolio": update_portfolios,
@@ -429,7 +428,7 @@ class TestPerformance:
             current_state, updates,
             id_columns=["portfolio", "security"],
             value_columns=["quantity", "price"],
-            system_date=date(2024, 1, 15),
+            system_date=pd.Timestamp("2024-01-15"),
         )
 
         elapsed = time.perf_counter() - start_time

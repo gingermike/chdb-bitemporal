@@ -13,7 +13,6 @@ import chdb
 import pandas as pd
 import tempfile
 import os
-from datetime import date
 from typing import NamedTuple
 
 
@@ -28,51 +27,51 @@ def compute_changes(
     updates: pd.DataFrame,
     id_columns: list[str],
     value_columns: list[str],
-    system_date: date | None = None,
+    system_date: pd.Timestamp | None = None,
 ) -> BitemporalChanges:
     """
     Compute bitemporal changes using timeline reconstruction.
-    
+
     Args:
-        current_state: DataFrame with columns: 
+        current_state: DataFrame with columns:
             [*id_columns, *value_columns, effective_from, effective_to, as_of_from, as_of_to]
         updates: DataFrame with columns:
             [*id_columns, *value_columns, effective_from, effective_to]
         id_columns: Columns that identify a unique timeseries
         value_columns: Columns containing the actual data values
         system_date: System date for as_of timestamps (defaults to today)
-    
+
     Returns:
         BitemporalChanges with expires and inserts DataFrames
     """
-    system_date = system_date or date.today()
-    
+    system_date = system_date or pd.Timestamp.today().normalize()
+
     # Write DataFrames to temporary parquet files for chdb to read
     with tempfile.TemporaryDirectory() as tmpdir:
         current_path = os.path.join(tmpdir, "current_state.parquet")
         updates_path = os.path.join(tmpdir, "updates.parquet")
-        
+
         current_state.to_parquet(current_path)
         updates.to_parquet(updates_path)
-        
+
         id_cols_sql = ", ".join(id_columns)
         value_cols_sql = ", ".join(value_columns)
         all_value_cols = ", ".join([f"any({c}) AS {c}" for c in value_columns])
-        
+
         # Build hash expression for change detection
         hash_cols = ", ".join([f"toString({c})" for c in value_columns])
         hash_expr = f"xxHash64(concat({hash_cols}))"
-        
+
         # File references for chdb
         current_file = f"file('{current_path}', Parquet)"
         updates_file = f"file('{updates_path}', Parquet)"
-        
+
         # The core CTEs implement timeline reconstruction
         core_ctes = f"""
-        WITH 
+        WITH
         -- Tag current state with source and priority
         current_tagged AS (
-            SELECT 
+            SELECT
                 {id_cols_sql},
                 {value_cols_sql},
                 effective_from,
@@ -87,10 +86,10 @@ def compute_changes(
             FROM {current_file}
             WHERE as_of_to IS NULL  -- Only consider active records
         ),
-        
+
         -- Tag updates with source and priority
         updates_tagged AS (
-            SELECT 
+            SELECT
                 {id_cols_sql},
                 {value_cols_sql},
                 effective_from,
@@ -263,11 +262,11 @@ def compute_changes(
             )
         )
         """
-        
+
         # Query for expires
         expires_value_cols = ", ".join([f"c.{v}" for v in value_columns])
         expires_query = core_ctes + f"""
-        SELECT 
+        SELECT
             c.{id_cols_sql.replace(', ', ', c.')},
             {expires_value_cols},
             c.effective_from,
@@ -277,10 +276,10 @@ def compute_changes(
         FROM current_tagged c
         WHERE c.original_row_id IN (SELECT original_row_id FROM to_expire)
         """
-        
+
         # Query for inserts
         inserts_query = core_ctes + f"""
-        SELECT 
+        SELECT
             {id_cols_sql},
             {value_cols_sql},
             effective_from,
@@ -290,11 +289,11 @@ def compute_changes(
         FROM to_insert
         ORDER BY {id_cols_sql}, effective_from
         """
-        
+
         # Execute queries
         expires_result = chdb.query(expires_query, output_format="DataFrame")
         inserts_result = chdb.query(inserts_query, output_format="DataFrame")
-        
+
         return BitemporalChanges(
             expires=expires_result if expires_result is not None else pd.DataFrame(),
             inserts=inserts_result if inserts_result is not None else pd.DataFrame(),
