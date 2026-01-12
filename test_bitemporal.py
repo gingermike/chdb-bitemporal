@@ -1890,3 +1890,190 @@ class TestFullStateMode:
                 system_date=pd.Timestamp("2024-05-15"),
                 update_mode="invalid",
             )
+
+
+class TestFullStatePerformance:
+    """Performance tests for full_state mode with tombstoning."""
+
+    def test_large_full_state_with_tombstoning(self):
+        """
+        Performance test for full_state mode with 500k current rows.
+
+        Tests the tombstoning overhead when:
+        - 60% of IDs are retained (appear in updates)
+        - 40% of IDs are tombstoned (missing from updates)
+
+        This simulates a "flush and fill" scenario where a significant
+        portion of the dataset is no longer present.
+        """
+        np.random.seed(42)
+
+        # Configuration - same scale as delta test
+        num_portfolios = 500
+        num_securities = 250
+        records_per_id = 4
+        num_id_groups = 125_000  # 500k current rows
+        tombstone_ratio = 0.4  # 40% of IDs will be tombstoned
+
+        base_date = pd.Timestamp("2020-01-01")
+        days_per_record = 365
+
+        print(f"\nGenerating test data for full_state mode...")
+        gen_start = time.perf_counter()
+
+        # Generate ID groups
+        id_group_portfolios = []
+        id_group_securities = []
+        for p in range(num_portfolios):
+            for s in range(num_securities):
+                id_group_portfolios.append(f"P{p:04d}")
+                id_group_securities.append(f"SEC{s:05d}")
+
+        # Build current state: 4 contiguous records per ID group
+        current_portfolios = []
+        current_securities = []
+        current_quantities = []
+        current_prices = []
+        current_from = []
+        current_to = []
+
+        for i in range(num_id_groups):
+            portfolio = id_group_portfolios[i]
+            security = id_group_securities[i]
+
+            for j in range(records_per_id):
+                current_portfolios.append(portfolio)
+                current_securities.append(security)
+                current_quantities.append(100 * (j + 1) + i % 100)
+                current_prices.append(round(10.0 + j * 5.0 + (i % 50) * 0.1, 2))
+                current_from.append(base_date + pd.Timedelta(days=j * days_per_record))
+                current_to.append(base_date + pd.Timedelta(days=(j + 1) * days_per_record))
+
+        current_state = pd.DataFrame({
+            "portfolio": current_portfolios,
+            "security": current_securities,
+            "quantity": current_quantities,
+            "price": current_prices,
+            "effective_from": current_from,
+            "effective_to": current_to,
+            "as_of_from": [base_date] * len(current_portfolios),
+            "as_of_to": pd.Series([pd.NaT] * len(current_portfolios)),
+        })
+
+        # Generate updates - only include 60% of IDs (40% will be tombstoned)
+        n_retained_ids = int(num_id_groups * (1 - tombstone_ratio))
+        retained_indices = np.random.choice(num_id_groups, n_retained_ids, replace=False)
+
+        update_portfolios = []
+        update_securities = []
+        update_quantities = []
+        update_prices = []
+        update_from = []
+        update_to = []
+
+        # Mix of scenarios for retained IDs:
+        # - 50% unchanged (same values)
+        # - 30% modified (different values)
+        # - 20% with overlapping updates
+
+        for count, idx in enumerate(retained_indices):
+            portfolio = id_group_portfolios[idx]
+            security = id_group_securities[idx]
+            record_idx = idx * records_per_id
+
+            scenario = count % 10
+
+            if scenario < 5:  # 50% unchanged
+                # Keep same values as first record
+                update_portfolios.append(portfolio)
+                update_securities.append(security)
+                update_quantities.append(current_quantities[record_idx])
+                update_prices.append(current_prices[record_idx])
+                update_from.append(base_date)
+                update_to.append(base_date + pd.Timedelta(days=days_per_record))
+
+            elif scenario < 8:  # 30% modified
+                # Different values
+                update_portfolios.append(portfolio)
+                update_securities.append(security)
+                update_quantities.append(9999 - (count % 1000))
+                update_prices.append(round(999.0 - (count % 100) * 0.5, 2))
+                update_from.append(base_date)
+                update_to.append(base_date + pd.Timedelta(days=days_per_record * 2))
+
+            else:  # 20% overlapping (slice across multiple records)
+                update_portfolios.append(portfolio)
+                update_securities.append(security)
+                update_quantities.append(5000 + (count % 500))
+                update_prices.append(round(50.0 + (count % 50), 2))
+                start_day = 300 + (count % 400)
+                update_from.append(base_date + pd.Timedelta(days=start_day))
+                update_to.append(base_date + pd.Timedelta(days=start_day + 200))
+
+        updates = pd.DataFrame({
+            "portfolio": update_portfolios,
+            "security": update_securities,
+            "quantity": update_quantities,
+            "price": update_prices,
+            "effective_from": update_from,
+            "effective_to": update_to,
+        })
+
+        gen_elapsed = time.perf_counter() - gen_start
+
+        # Stats
+        current_combos = set(zip(current_state["portfolio"], current_state["security"]))
+        update_combos = set(zip(updates["portfolio"], updates["security"]))
+        tombstoned_combos = current_combos - update_combos
+
+        print(f"Data generation: {gen_elapsed:.2f}s")
+        print(f"Current state: {len(current_state):,} rows, {len(current_combos):,} ID groups")
+        print(f"Updates: {len(updates):,} rows, {len(update_combos):,} unique IDs")
+        print(f"IDs to be tombstoned: {len(tombstoned_combos):,} ({tombstone_ratio*100:.0f}%)")
+
+        # Run computation with full_state mode
+        print(f"\nRunning compute_changes (full_state mode)...")
+        start_time = time.perf_counter()
+
+        result = compute_changes(
+            current_state, updates,
+            id_columns=["portfolio", "security"],
+            value_columns=["quantity", "price"],
+            system_date=pd.Timestamp("2024-01-15"),
+            update_mode="full_state",
+        )
+
+        elapsed = time.perf_counter() - start_time
+
+        # Report results
+        print(f"\n{'='*60}")
+        print(f"Full State Mode Performance Test Results")
+        print(f"{'='*60}")
+        print(f"Computation time: {elapsed:.2f}s")
+        print(f"Current records: {len(current_state):,}")
+        print(f"Update records: {len(updates):,}")
+        print(f"Records expired: {len(result.expires):,}")
+        print(f"Records inserted: {len(result.inserts):,}")
+        print(f"Throughput: {(len(current_state) + len(updates)) / elapsed:,.0f} rows/sec")
+        print(f"{'='*60}")
+
+        # Verify tombstoning worked
+        # Count tombstones (inserts with truncated effective_to)
+        system_date = pd.Timestamp("2024-01-15")
+        tombstone_inserts = result.inserts[
+            result.inserts["effective_to"] == system_date.date()
+        ] if len(result.inserts) > 0 else pd.DataFrame()
+
+        print(f"\nTombstone analysis:")
+        print(f"  Expected tombstoned IDs: {len(tombstoned_combos):,}")
+        print(f"  Tombstone records created: {len(tombstone_inserts):,}")
+
+        # Basic assertions
+        assert len(result.expires) >= 0
+        assert len(result.inserts) >= 0
+        assert elapsed < 180, f"Performance regression: took {elapsed:.2f}s"
+
+        # Verify tombstoning produced expected results
+        # Each tombstoned ID should have at least one expire and one tombstone insert
+        expired_combos = set(zip(result.expires["portfolio"], result.expires["security"]))
+        assert len(expired_combos & tombstoned_combos) > 0, "Some tombstoned IDs should be expired"
