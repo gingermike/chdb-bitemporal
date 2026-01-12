@@ -14,6 +14,7 @@ The algorithm handles:
 - Adjacent segments with identical values are merged
 - Composite ID columns (e.g., portfolio + security)
 - Multiple value columns with change detection via hashing
+- Two update modes: **delta** (overlay) and **full_state** (flush and fill with tombstoning)
 
 ## Installation
 
@@ -71,9 +72,43 @@ The above produces:
   - `[2024-06-01, 2024-08-31)` value=200
   - `[2024-08-31, 2024-12-31)` value=100
 
+### Full State Mode (Flush and Fill)
+
+Use `update_mode="full_state"` when updates represent the complete current state. IDs present in current state but missing from updates will be tombstoned (their `effective_to` is set to `system_date`).
+
+```python
+# Current state has IDs A and B
+current_state = pd.DataFrame({
+    "id": ["A", "B"],
+    "value": [100, 200],
+    "effective_from": pd.to_datetime(["2024-01-01", "2024-01-01"]),
+    "effective_to": pd.to_datetime(["2024-12-31", "2024-12-31"]),
+    "as_of_from": pd.to_datetime(["2024-01-01", "2024-01-01"]),
+    "as_of_to": [None, None],
+})
+
+# Updates only contain A - B will be tombstoned
+updates = pd.DataFrame({
+    "id": ["A"],
+    "value": [150],
+    "effective_from": pd.to_datetime(["2024-01-01"]),
+    "effective_to": pd.to_datetime(["2024-12-31"]),
+})
+
+result = compute_changes(
+    current_state, updates,
+    id_columns=["id"],
+    value_columns=["value"],
+    system_date=pd.Timestamp("2024-05-15"),
+    update_mode="full_state",  # Enable tombstoning
+)
+
+# B is tombstoned: its effective_to is set to 2024-05-15
+```
+
 ## API
 
-### `compute_changes(current_state, updates, id_columns, value_columns, system_date=None)`
+### `compute_changes(current_state, updates, id_columns, value_columns, system_date=None, update_mode="delta")`
 
 **Parameters:**
 - `current_state`: DataFrame with columns `[*id_columns, *value_columns, effective_from, effective_to, as_of_from, as_of_to]`
@@ -81,6 +116,9 @@ The above produces:
 - `id_columns`: list of column names that identify a unique timeseries
 - `value_columns`: list of column names containing the data values
 - `system_date`: date for `as_of_from`/`as_of_to` timestamps (defaults to today)
+- `update_mode`: either `"delta"` or `"full_state"`
+  - `"delta"` (default): updates overlay on current state; IDs not in updates are unchanged
+  - `"full_state"`: updates represent complete state; IDs in current but not in updates are tombstoned
 
 **Returns:** `BitemporalChanges(expires, inserts)`
 - `expires`: DataFrame of records to close (includes `as_of_to` set to `system_date`)
@@ -98,16 +136,32 @@ All of this happens in a single SQL query executed by chdb.
 
 ## Performance
 
+### Delta Mode
+
 Tested with 500k current state rows (125k ID groups, 4 records each) and 300k updates:
 
 | Metric | Value |
 |--------|-------|
-| Computation time | ~0.27s |
-| Throughput | ~3M rows/sec |
-| Records expired | ~197k |
-| Records inserted | ~630k |
+| Computation time | ~1.2s |
+| Throughput | ~650k rows/sec |
+| Records expired | ~234k |
+| Records inserted | ~568k |
 
 Update mix: 40% overlapping, 20% adjacent same-value, 20% same-value no-op, 20% new IDs.
+
+### Full State Mode
+
+Tested with 500k current state rows (125k ID groups) and 75k updates (40% of IDs tombstoned):
+
+| Metric | Value |
+|--------|-------|
+| Computation time | ~0.9s |
+| Throughput | ~633k rows/sec |
+| Records expired | ~269k |
+| Records inserted | ~268k |
+| Tombstone records | ~200k |
+
+Full state mode adds minimal overhead despite the additional tombstone generation queries.
 
 ### Implementation Notes
 
